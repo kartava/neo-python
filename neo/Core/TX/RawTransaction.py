@@ -67,12 +67,12 @@ class RawTransaction(Transaction):
             raise TypeError('Please enter your description as a string.')
 
         if len(description) > TransactionAttribute.MAX_ATTR_DATA_SIZE:
-            raise RawTXError('Exceeded max attribute size.')
+            raise TXAttributeError('Exceeded max attribute size.')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Description, data=description))
         else:
-            raise RawTXError('Max number of transaction attributes reached.')
+            raise TXAttributeError('Max number of transaction attributes reached.')
 
     def addDescriptionUrl(self, description_url):
         """
@@ -85,12 +85,12 @@ class RawTransaction(Transaction):
             raise TypeError('Please enter your description url as a string.')
 
         if len(description_url) > 255:
-            raise RawTXError('Exceeded max attribute size.')
+            raise TXAttributeError('Exceeded max attribute size.')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.DescriptionUrl, data=description_url))
         else:
-            raise RawTXError('Max number of transaction attributes reached.')
+            raise TXAttributeError('Max number of transaction attributes reached.')
 
     def addRemark(self, remark):
         """
@@ -103,7 +103,7 @@ class RawTransaction(Transaction):
             raise TypeError('Please enter your remark as a string.')
 
         if len(remark) > TransactionAttribute.MAX_ATTR_DATA_SIZE:
-            raise RawTXError('Exceeded max attribute size.')
+            raise TXAttributeError('Exceeded max attribute size.')
 
         for attribute in self.Attributes:
             remarks = []
@@ -119,12 +119,12 @@ class RawTransaction(Transaction):
             if last_remark < 255:
                 new_remark = last_remark + 1
             else:
-                raise RawTXError('Max number of remarks reached.')
+                raise TXAttributeError('Max number of remarks reached.')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=new_remark, data=remark))
         else:
-            raise RawTXError('Max number of transaction attributes reached.')
+            raise TXAttributeError('Max number of transaction attributes reached.')
 
     def addScript(self, data):
         """
@@ -137,12 +137,12 @@ class RawTransaction(Transaction):
             data = data.Data
 
         if len(data) > 20:
-            raise RawTXError('Exceeded max attribute size.')
+            raise TXAttributeError('Exceeded max attribute size.')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=data))
         else:
-            raise RawTXError('Max number of transaction attributes reached.')
+            raise TXAttributeError('Max number of transaction attributes reached.')
 
     def sourceAddress(self, from_addr, network="mainnet"):
         """
@@ -163,6 +163,10 @@ class RawTransaction(Transaction):
             raise RawTXError(f"{network} is not a supported network.")
         bal = requests.get(url=url)
 
+        if not bal.status_code == 200:
+            raise NetworkError('Neoscan request failed. Please check your internet connection.')
+
+        bal = bal.json()
         if not bal['balance']:
             raise RawTXError(f"Address {from_addr} has a zero balance. Please ensure the correct network is selected or specify a difference source address.")
         self.BALANCE = bal['balance']
@@ -192,7 +196,7 @@ class RawTransaction(Transaction):
         elif asset == Blockchain.GetSystemCoin().Hash:
             assetId = Blockchain.GetSystemCoin().Hash
         else:
-            raise RawTXError(f'Asset {asset} not found. If trying to send tokens use the `buildTokenTransfer` function.')
+            raise AssetError(f'Asset {asset} not found. If trying to send tokens use the `buildTokenTransfer` function.')
 
         for asset in self.BALANCE:
             if assetId == asset['asset_hash']:
@@ -224,17 +228,17 @@ class RawTransaction(Transaction):
         elif asset == Blockchain.GetSystemCoin().Hash:
             assetId = Blockchain.GetSystemCoin().Hash
         else:
-            raise RawTXError(f'Asset {asset} not found. If trying to send tokens use the `buildTokenTransfer` function.')
+            raise AssetError(f'Asset {asset} not found. If trying to send tokens use the `buildTokenTransfer` function.')
 
         dest_scripthash = Helper.AddrStrToScriptHash(to_addr)  # also verifies if the address is valid
 
         if float(amount) == 0:
-            raise RawTXError('Amount cannot be 0.')
+            raise ValueError('Amount cannot be 0.')
         f8amount = Fixed8.TryParse(amount, require_positive=True)
         if f8amount is None:
-            raise RawTXError('Invalid amount format.')
+            raise ValueError('Invalid amount format.')
         elif assetId == Blockchain.GetSystemShare().Hash and f8amount.value != f8amount.ToInt():
-            raise RawTXError('Incorrect amount precision.')
+            raise ValueError('Incorrect amount precision.')
 
         # check if the outputs exceed the available unspents
         subtotal = []
@@ -315,7 +319,7 @@ class RawTransaction(Transaction):
         Verify the transaction.
         """
         if self.Size() > self.MAX_TX_SIZE:
-            raise RawTXError('Maximum transaction size exceeded.')
+            raise TXAttributeError('Maximum transaction size exceeded.')
 
         # calculate and verify the required network fee for the tx
         if not self._network_fee:
@@ -328,20 +332,17 @@ class RawTransaction(Transaction):
             if fee < req_fee:
                 raise TXFeeError(f'The tx size ({tx.Size()}) exceeds the max free tx size ({settings.MAX_FREE_TX_SIZE}).\nA network fee of {req_fee.ToString()} GAS is required.')
 
-    def Sign(self, path, password, WIForNEP2, NEP2password=None):
+    def Sign(self, WIForNEP2, NEP2password=None):
         """
-        Create a wallet instance and sign the raw transaction
+        Sign the raw transaction
 
         Args:
-            path: (str) the path for the wallet instance to be saved
-            password: (str) the password for the wallet instance
             WIForNEP2: (str) the WIF or NEP2 key string from the address you are sending from. NOTE: Assumes WIF if NEP2password is None.
             NEP2password: (str, optional) the NEP2 password associated with the NEP2 key string. Defaults to None.
         """
-
-        if os.path.exists(path):
-            raise RawTXError("File already exists.")
-        wallet = UserWallet.Create(path, to_aes_key(password), generate_default_key=False)
+        temp_path = "temp_wallet.wallet"
+        temp_password = "1234567890"
+        wallet = UserWallet.Create(temp_path, to_aes_key(temp_password), generate_default_key=False)
         if NEP2password:
             private_key = KeyPair.PrivateKeyFromNEP2(WIForNEP2, NEP2password)
         else:
@@ -352,19 +353,27 @@ class RawTransaction(Transaction):
         if context.Completed:
             self.scripts = context.GetScripts()
         else:
-            raise RawTXError(f"Transaction initiated, but the signature is incomplete. Use the `sign` command with the information below to complete signing.\n{json.dumps(context.ToJson(), separators=(',', ':'))}")
+            raise SignatureError(f"Transaction initiated, but the signature is incomplete. Use the `sign` command with the information below to complete signing.\n{json.dumps(context.ToJson(), separators=(',', ':'))}")
+        wallet.Close()
+        wallet = None
+        os.remove(temp_path)
 
     def getTXID(self):
         """
-        Returns the hash of the transaction. NOTE: Assumes the transaction is signed.
+        Returns the hash of the transaction.
         """
+        context = ContractParametersContext(self)
+        if not context.Completed:
+            raise SignatureError('Please sign the transaction.')
         return self.Hash.ToString()
 
     def getRawTX(self):
         """
         Returns the transaction array, which is the input for "params" if sending via "sendrawtransaction".
-        NOTE: Assumes the transaction is signed.
         """
+        context = ContractParametersContext(self)
+        if not context.Completed:
+            raise SignatureError('Please sign the transaction.')
         return self.ToArray()
 
     def Size(self):
@@ -431,6 +440,10 @@ class RawTransaction(Transaction):
             raise RawTXError(f"{network} is not a supported network.")
         available = requests.get(url=url)
 
+        if not available.status_code == 200:
+            raise NetworkError('Neoscan request failed. Please check your internet connection.')
+
+        available = available.json()
         if available["unclaimed"] == 0:
             raise RawTXError(f"Address {claim_addr} has 0 unclaimed GAS. Please ensure the correct network is selected or specify a difference source address.")
 
@@ -440,6 +453,10 @@ class RawTransaction(Transaction):
             url = f"https://neoscan-testnet.io/api/test_net/v1/get_claimable/{claim_addr}"
         res = requests.get(url=url)
 
+        if not res.status_code == 200:
+            raise NetworkError('Neoscan request failed. Please check your internet connection.')
+
+        res = res.json()
         for ref in res['claimable']:
             self.Claims.append(CoinReference(prev_hash=UInt256(data=binascii.unhexlify(ref['txid'])), prev_index=ref['n']))
 
@@ -451,4 +468,24 @@ class RawTransaction(Transaction):
 
 class RawTXError(Exception):
     """Provide user-friendly feedback for RawTransaction errors"""
+    pass
+
+
+class NetworkError(Exception):
+    """Provide user-friendly feedback for network errors"""
+    pass
+
+
+class TXAttributeError(Exception):
+    """Provide user-friendly feedback for transaction attribute errors"""
+    pass
+
+
+class AssetError(Exception):
+    """Provide user-friendly feedback for asset errors"""
+    pass
+
+
+class SignatureError(Exception):
+    """Provide user-friendly feedback for signature errors"""
     pass
