@@ -1,0 +1,454 @@
+import os
+import binascii
+import requests
+import json
+from neo import Blockchain
+from neo.Settings import settings
+from neo.Core.CoinReference import CoinReference
+from neo.Core.TX.Transaction import Transaction, TransactionType, TransactionOutput, TXFeeError
+from neo.Core.TX.TransactionAttribute import TransactionAttribute, TransactionAttributeUsage
+from neo.Core.Helper import Helper
+from neo.Core.Size import GetVarSize
+from neo.Implementations.Wallets.peewee.UserWallet import UserWallet
+from neo.SmartContract.ContractParameterContext import ContractParametersContext
+from neo.Wallets.utils import to_aes_key
+from neocore.Fixed8 import Fixed8
+from neocore.UInt256 import UInt256
+from neocore.UIntBase import UIntBase
+from neocore.KeyPair import KeyPair
+
+
+class RawTransaction(Transaction):
+    """A class for building raw transactions."""
+    SOURCE_SCRIPTHASH = None
+    BALANCE = None
+
+    def __init__(self, *args, **kwargs):
+        """
+        Create an instance.
+
+        Args:
+            *args:
+            **kwargs:
+        """
+        super(RawTransaction, self).__init__(*args, **kwargs)
+        self.raw_tx = True
+
+    def TXType(self, attribute):
+        """
+        Specify the type of transaction
+
+        Args:
+            attribute: (str) the type of transaction. Currently supports "Claim", "Contract", or "Invocation".
+        """
+        if attribute.lower() == "claim":
+            self.Type = TransactionType.ClaimTransaction
+            self.Claims = []
+
+        elif attribute.lower() == "contract":
+            self.Type = TransactionType.ContractTransaction
+
+        elif attribute.lower() == "invocation":
+            self.Script = None
+            self.Gas = Fixed8(0)
+            self.Type == TransactionType.InvocationTransaction
+
+        else:
+            raise TypeError("Please specify a supported transaction type.")
+
+    def addDescription(self, description):
+        """
+        Specify a description for the transaction
+
+        Args:
+            description: (str) a description attribute for the transaction
+        """
+        if not isinstance(description, str):
+            raise TypeError('Please enter your description as a string.')
+
+        if len(description) > TransactionAttribute.MAX_ATTR_DATA_SIZE:
+            raise RawTXError('Exceeded max attribute size.')
+
+        if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
+            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Description, data=description))
+        else:
+            raise RawTXError('Max number of transaction attributes reached.')
+
+    def addDescriptionUrl(self, description_url):
+        """
+        Specify a description for the transaction
+
+        Args:
+            description url: (str) a description url attribute for the transaction
+        """
+        if not isinstance(description_url, str):
+            raise TypeError('Please enter your description url as a string.')
+
+        if len(description_url) > 255:
+            raise RawTXError('Exceeded max attribute size.')
+
+        if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
+            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.DescriptionUrl, data=description_url))
+        else:
+            raise RawTXError('Max number of transaction attributes reached.')
+
+    def addRemark(self, remark):
+        """
+        Specify a remark for the transaction
+
+        Args:
+            remark: (str) a remark attribute for the transaction
+        """
+        if not isinstance(remark, str):
+            raise TypeError('Please enter your remark as a string.')
+
+        if len(remark) > TransactionAttribute.MAX_ATTR_DATA_SIZE:
+            raise RawTXError('Exceeded max attribute size.')
+
+        for attribute in self.Attributes:
+            remarks = []
+            if attribute.Usage in range(240, 255):
+                remarks.append(attribute.Usage)
+
+        new_remark = 240
+        if remarks:
+            remarks = sorted(remarks)
+
+            last_remark = remarks[-1]
+
+            if last_remark < 255:
+                new_remark = last_remark + 1
+            else:
+                raise RawTXError('Max number of remarks reached.')
+
+        if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
+            self.Attributes.append(TransactionAttribute(usage=new_remark, data=remark))
+        else:
+            raise RawTXError('Max number of transaction attributes reached.')
+
+    def addScript(self, data):
+        """
+        Specify a script for the transaction
+
+        Args:
+            script: (various) an additional address for transaction validation
+        """
+        if isinstance(data, UIntBase):
+            data = data.Data
+
+        if len(data) > 20:
+            raise RawTXError('Exceeded max attribute size.')
+
+        if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
+            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=data))
+        else:
+            raise RawTXError('Max number of transaction attributes reached.')
+
+    def sourceAddress(self, from_addr, network="mainnet"):
+        """
+        Specify the source address for the transaction. Also sets the inputs for the transaction.
+
+        Args:
+            from_addr: (str) the source NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+            network: (str) the network to query (i.e. 'mainnet' or 'testnet'). Defaults to "mainnet".
+        """
+        src_scripthash = Helper.AddrStrToScriptHash(from_addr)  # also verifies if the address is valid
+        self.SOURCE_SCRIPTHASH = src_scripthash
+
+        if network.lower() == "mainnet":
+            url = f"https://api.neoscan.io/api/main_net/v1/get_balance/{from_addr}"
+        elif network.lower() == "testnet":
+            url = f"https://neoscan-testnet.io/api/test_net/v1/get_balance/{from_addr}"
+        else:
+            raise RawTXError(f"{network} is not a supported network.")
+        bal = requests.get(url=url)
+
+        if not bal['balance']:
+            raise RawTXError(f"Address {from_addr} has a zero balance. Please ensure the correct network is selected or specify a difference source address.")
+        self.BALANCE = bal['balance']
+
+    def addInputs(self, asset):
+        """
+        Specify inputs for the transaction based on the asset to be sent.
+        NOTE: Can be used multiple times if sending multiple assets (i.e. NEO and GAS).
+
+        Args:
+            asset: (str) the asset name or asset hash
+        """
+        if not isinstance(asset, str):
+            raise TypeError('Please enter the asset as a string.')
+
+        if not self.BALANCE:
+            raise RawTXError('Please specify a source address before adding inputs.')
+
+        if asset[0:1] == "0x":
+            asset == asset[2:]
+        if asset.lower() == "neo":
+            assetId = Blockchain.GetSystemShare().Hash
+        elif asset == Blockchain.GetSystemShare().Hash:
+            assetId = Blockchain.GetSystemShare().Hash
+        elif asset.lower() == "gas":
+            assetId = Blockchain.GetSystemCoin().Hash
+        elif asset == Blockchain.GetSystemCoin().Hash:
+            assetId = Blockchain.GetSystemCoin().Hash
+        else:
+            raise RawTXError(f'Asset {asset} not found. If trying to send tokens use the `buildTokenTransfer` function.')
+
+        for asset in self.BALANCE:
+            if assetId == asset['asset_hash']:
+                if not asset['unspent']:
+                    raise RawTXError('No unspent assets found.')
+                for unspent in asset['unspent']:
+                    self.inputs.append(CoinReference(prev_hash=UInt256(data=binascii.unhexlify(unspent['txid'])), prev_index=unspent['n'])) 
+        if not self.inputs:
+            raise RawTXError('No matching assets found at the specified source address.')
+
+    def addOutput(self, asset, to_addr, amount):
+        """
+        Specify an output for the transaction.
+        NOTE: Can be used multiple times to create multiple outputs.
+
+        Args:
+            asset: (str) the asset name or asset hash
+            to_addr: (str) the destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+            amount: (int/decimal) the amount of the asset to send
+        """
+        if asset[0:1] == "0x":
+            asset == asset[2:]
+        if asset.lower() == "neo":
+            assetId = Blockchain.GetSystemShare().Hash
+        elif asset == Blockchain.GetSystemShare().Hash:
+            assetId = Blockchain.GetSystemShare().Hash
+        elif asset.lower() == "gas":
+            assetId = Blockchain.GetSystemCoin().Hash
+        elif asset == Blockchain.GetSystemCoin().Hash:
+            assetId = Blockchain.GetSystemCoin().Hash
+        else:
+            raise RawTXError(f'Asset {asset} not found. If trying to send tokens use the `buildTokenTransfer` function.')
+
+        dest_scripthash = Helper.AddrStrToScriptHash(to_addr)  # also verifies if the address is valid
+
+        if float(amount) == 0:
+            raise RawTXError('Amount cannot be 0.')
+        f8amount = Fixed8.TryParse(amount, require_positive=True)
+        if f8amount is None:
+            raise RawTXError('Invalid amount format.')
+        elif assetId == Blockchain.GetSystemShare().Hash and f8amount.value != f8amount.ToInt():
+            raise RawTXError('Incorrect amount precision.')
+
+        # check if the outputs exceed the available unspents
+        subtotal = []
+        if self.outputs:
+            for output in self.outputs:
+                if output.AssetId == assetId:
+                    subtotal.append(output.Value.value)
+        total = f8amount.value + sum(subtotal)
+        for asset in self.BALANCE:
+            if assetId == asset['asset_hash']:
+                if total > asset['amount']:
+                    raise RawTXError('Total outputs exceed the available unspents.')
+
+        self.outputs.append(TransactionOutput(AssetId=assetId, Value=f8amount, script_hash=dest_scripthash))
+
+    def addNetworkFee(self, fee):
+        """
+        Specify a priority network fee.
+
+        Args:
+            fee: (decimal) the priority network fee
+        """
+        if self.Type == b'\x02':  # ClaimTransaction
+            raise RawTXError('Network fees are not required for ClaimTransactions.')
+
+        fee = Fixed8.FromDecimal(fee)
+        self._network_fee = fee
+
+    def addChange(self, change_addr=SOURCE_SCRIPTHASH):
+        """
+        Specify the change output(s). NOTE: Assumes all other outputs have been added.
+
+        Args:
+            change_addr: (str, optional) specify a change address. NOTE: Defaults to the sourceAddress.
+        """
+        if change_addr != self.SOURCE_SCRIPTHASH:
+            change_hash = Helper.AddrStrToScriptHash(change_addr)  # also verifies if the address is valid
+        elif not self.SOURCE_SCRIPTHASH:
+            raise RawTXError("Please specify a source address prior to creating change output(s).")
+        else:
+            change_hash = change_addr
+
+        if not self.outputs:
+            raise RawTXError("Please specify outputs prior to creating change output(s).")
+
+        neo = []
+        gas = []
+        for output in self.outputs:
+            if output.AssetId == Blockchain.GetSystemShare().Hash:
+                neo.append(output.Value.value)
+            elif output.AssetId == Blockchain.GetSystemCoin().Hash:
+                gas.append(output.Value.value)
+        if self.SystemFee() > Fixed8.Zero():
+            gas.append(self.SystemFee().value)
+        if self._network_fee:
+            if self._network_fee > Fixed8.Zero():
+                gas.append(self._network_fee.value)
+        neo_total = 0
+        gas_total = 0
+        for asset in self.BALANCE:
+            if asset['asset_hash'] == Blockchain.GetSystemShare().Hash:
+                neo_total = asset['amount']
+            elif asset['asset_hash'] == Blockchain.GetSystemCoin().Hash:
+                gas_total = asset['amount']
+        neo_diff = Fixed8.FromDecimal(neo_total).value - sum(neo)
+        gas_diff = Fixed8.FromDecimal(gas_total).value - sum(gas)
+
+        if neo_diff < 0 or gas_diff < 0:
+            raise RawTXError('Total outputs exceed the available unspents.')
+
+        if neo_diff > 0:
+            self.outputs.append(TransactionOutput(AssetId=Blockchain.GetSystemShare().Hash, Value=Fixed8.FromDecimal(neo_diff), script_hash=change_hash))
+        if gas_diff > 0:
+            self.outputs.append(TransactionOutput(AssetId=Blockchain.GetSystemCoin().Hash, Value=Fixed8.FromDecimal(gas_diff), script_hash=change_hash))
+
+    def Verify(self):
+        """
+        Verify the transaction.
+        """
+        if self.Size() > self.MAX_TX_SIZE:
+            raise RawTXError('Maximum transaction size exceeded.')
+
+        # calculate and verify the required network fee for the tx
+        if not self._network_fee:
+            self._network_fee = Fixed8.Zero()
+        fee = self._network_fee
+        if self.Size() > settings.MAX_FREE_TX_SIZE:
+            req_fee = Fixed8.FromDecimal(settings.FEE_PER_EXTRA_BYTE * (self.Size() - settings.MAX_FREE_TX_SIZE))
+            if req_fee < settings.LOW_PRIORITY_THRESHOLD:
+                req_fee = settings.LOW_PRIORITY_THRESHOLD
+            if fee < req_fee:
+                raise TXFeeError(f'The tx size ({tx.Size()}) exceeds the max free tx size ({settings.MAX_FREE_TX_SIZE}).\nA network fee of {req_fee.ToString()} GAS is required.')
+
+    def Sign(self, path, password, WIForNEP2, NEP2password=None):
+        """
+        Create a wallet instance and sign the raw transaction
+
+        Args:
+            path: (str) the path for the wallet instance to be saved
+            password: (str) the password for the wallet instance
+            WIForNEP2: (str) the WIF or NEP2 key string from the address you are sending from. NOTE: Assumes WIF if NEP2password is None.
+            NEP2password: (str, optional) the NEP2 password associated with the NEP2 key string. Defaults to None.
+        """
+
+        if os.path.exists(path):
+            raise RawTXError("File already exists.")
+        wallet = UserWallet.Create(path, to_aes_key(password), generate_default_key=False)
+        if NEP2password:
+            private_key = KeyPair.PrivateKeyFromNEP2(WIForNEP2, NEP2password)
+        else:
+            private_key = KeyPair.PrivateKeyFromWIF(WIForNEP2)
+        wallet.CreateKey(private_key)
+        context = ContractParametersContext(self)
+        wallet.Sign(context)
+        if context.Completed:
+            self.scripts = context.GetScripts()
+        else:
+            raise RawTXError(f"Transaction initiated, but the signature is incomplete. Use the `sign` command with the information below to complete signing.\n{json.dumps(context.ToJson(), separators=(',', ':'))}")
+
+    def getTXID(self):
+        """
+        Returns the hash of the transaction. NOTE: Assumes the transaction is signed.
+        """
+        return self.Hash.ToString()
+
+    def getRawTX(self):
+        """
+        Returns the transaction array, which is the input for "params" if sending via "sendrawtransaction".
+        NOTE: Assumes the transaction is signed.
+        """
+        return self.ToArray()
+
+    def Size(self):
+        """
+        Get the total size in bytes of the object.
+
+        Returns:
+            int: size.
+        """
+        if self.Type == b'\x02':  # ClaimTransaction
+            return super(RawTransaction, self).Size() + GetVarSize(self.Claims)
+        elif self.Type == b'\xd1':  # InvocationTransaction
+            return super(RawTransaction, self).Size() + GetVarSize(self.Script)
+        else:
+            return super(RawTransaction, self).Size()
+
+    def SystemFee(self):
+        """
+        Get the system fee.
+
+        Returns:
+            Fixed8:
+        """
+        if self.Type == b'\xd1':  # InvocationTransaction
+            return self.Gas
+        else:
+            return super(RawTransaction, self).SystemFee()
+
+    def ToJson(self):
+        """
+        Convert object members to a dictionary that can be parsed as JSON.
+
+        Returns:
+             dict:
+        """
+        if self.Type == b'\x02':  # ClaimTransaction
+            json = super(RawTransaction, self).ToJson()
+            json['claims'] = [claim.ToJson() for claim in self.Claims]
+            return json
+        elif self.Type == b'\xd1':  # InvocationTransaction
+            jsn = super(RawTransaction, self).ToJson()
+            jsn['script'] = self.Script.hex()
+            jsn['gas'] = self.Gas.ToNeoJsonString()
+            return jsn
+        else:
+            return super(RawTransaction, self).ToJson()
+
+    def buildClaimTX(self, claim_addr, network="mainnet", to_addr=None):
+        """
+        Builds a claim transaction for the specified address.
+
+        Args:
+            claim_addr: (str) the address from which the claim is being constructed (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3'). NOTE: Claimed GAS is sent to the claim_addr by default
+            network: (str) the network to query (i.e. 'mainnet' or 'testnet'). Defaults to "mainnet".
+            to_addr: (str, optional) specify a different destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+        """
+        dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+
+        if network.lower() == "mainnet":
+            url = f"https://api.neoscan.io/api/main_net/v1/get_unclaimed/{claim_addr}"
+        elif network.lower() == "testnet":
+            url = f"https://neoscan-testnet.io/api/test_net/v1/get_unclaimed/{claim_addr}"
+        else:
+            raise RawTXError(f"{network} is not a supported network.")
+        available = requests.get(url=url)
+
+        if available["unclaimed"] == 0:
+            raise RawTXError(f"Address {claim_addr} has 0 unclaimed GAS. Please ensure the correct network is selected or specify a difference source address.")
+
+        if network.lower() == "mainnet":
+            url = f"https://api.neoscan.io/api/main_net/v1/get_claimable/{claim_addr}"
+        elif network.lower() == "testnet":
+            url = f"https://neoscan-testnet.io/api/test_net/v1/get_claimable/{claim_addr}"
+        res = requests.get(url=url)
+
+        for ref in res['claimable']:
+            self.Claims.append(CoinReference(prev_hash=UInt256(data=binascii.unhexlify(ref['txid'])), prev_index=ref['n']))
+
+        if to_addr:
+            dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+
+        self.outputs = [TransactionOutput(AssetId=Blockchain.GetSystemCoin().Hash, Value=Fixed8.FromDecimal(available), script_hash=dest_scripthash)]
+
+
+class RawTXError(Exception):
+    """Provide user-friendly feedback for RawTransaction errors"""
+    pass

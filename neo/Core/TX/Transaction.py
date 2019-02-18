@@ -249,6 +249,7 @@ class Transaction(InventoryMixin):
 
     __references = None
 
+    MAX_TX_SIZE = 102400
     MAX_TX_ATTRIBUTES = 16
 
     withdraw_hold = None
