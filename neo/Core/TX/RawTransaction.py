@@ -11,9 +11,11 @@ from neo.Core.Size import GetVarSize
 from neo.Implementations.Wallets.peewee.UserWallet import UserWallet
 from neo.SmartContract.ContractParameterContext import ContractParametersContext
 from neo.Wallets.utils import to_aes_key
+from neo.VM.ScriptBuilder import ScriptBuilder
 from neocore.Fixed8 import Fixed8
 from neocore.UInt256 import UInt256
-from neocore.UIntBase import UIntBase
+from neocore.UInt160 import UInt160
+from neocore.BigInteger import BigInteger
 from neocore.KeyPair import KeyPair
 from itertools import groupby
 
@@ -60,7 +62,7 @@ class RawTransaction(Transaction):
         elif attribute.lower() == "invocation":
             self.Script = None
             self.Gas = Fixed8(0)
-            self.Type == TransactionType.InvocationTransaction
+            self.Type = TransactionType.InvocationTransaction
 
         else:
             raise TypeError("Please specify a supported transaction type.")
@@ -138,22 +140,17 @@ class RawTransaction(Transaction):
         else:
             raise TXAttributeError('Max number of transaction attributes reached.')
 
-    def addScript(self, data):
+    def addScript(self, address):
         """
         Specify a script for the transaction
 
         Args:
-            script: (str) an additional address for transaction validation
+            address: (str) an additional address for transaction validation
         """
-        if not isinstance(data, str):
-            raise TypeError('Please enter your script as a string.')
-
-        data = data.encode('utf-8')
-        if len(data) > 20:
-            raise TXAttributeError('Exceeded max attribute size.')
+        address = Helper.AddrStrToScriptHash(address)  # also verifies if the address is valid
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
-            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=data))
+            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=address))
         else:
             raise TXAttributeError('Max number of transaction attributes reached.')
 
@@ -216,11 +213,11 @@ class RawTransaction(Transaction):
         for asset in self.BALANCE:
             if assetId == asset['asset_hash']:
                 if not asset['unspent']:
-                    raise RawTXError('No unspent assets found.')
+                    raise AssetError('No unspent assets found.')
                 for unspent in asset['unspent']:
                     self.inputs.append(CoinReference(prev_hash=UInt256.ParseString(unspent['txid']), prev_index=unspent['n'])) 
         if not self.inputs:
-            raise RawTXError('No matching assets found at the specified source address.')
+            raise AssetError('No matching assets found at the specified source address.')
 
     def addOutput(self, asset, to_addr, amount):
         """
@@ -266,7 +263,7 @@ class RawTransaction(Transaction):
         for asset in self.BALANCE:
             if assetId == asset['asset_hash']:
                 if total > asset['amount']:
-                    raise RawTXError('Total outputs exceed the available unspents.')
+                    raise AssetError('Total outputs exceed the available unspents.')
 
         self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(assetId), Value=f8amount, script_hash=dest_scripthash))
 
@@ -323,7 +320,7 @@ class RawTransaction(Transaction):
         gas_diff = Fixed8.FromDecimal(gas_total) - Fixed8(sum(gas))
 
         if neo_diff < Fixed8.Zero() or gas_diff < Fixed8.Zero():
-            raise RawTXError('Total outputs exceed the available unspents.')
+            raise AssetError('Total outputs exceed the available unspents.')
 
         if neo_diff > Fixed8.Zero():
             self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.neo_asset_id), Value=neo_diff, script_hash=change_hash))
@@ -609,7 +606,7 @@ class RawTransaction(Transaction):
         res = res.json()
         available = res["unclaimed"]
         if available == 0:
-            raise RawTXError(f"Address {claim_addr} has 0 unclaimed GAS. Please ensure the correct network is selected or specify a difference source address.")
+            raise AssetError(f"Address {claim_addr} has 0 unclaimed GAS. Please ensure the correct network is selected or specify a difference source address.")
 
         for ref in res['claimable']:
             self.Claims.append(CoinReference(prev_hash=UInt256.ParseString(ref['txid']), prev_index=ref['n']))
@@ -618,6 +615,63 @@ class RawTransaction(Transaction):
             dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
 
         self.outputs = [TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=Fixed8.FromDecimal(available), script_hash=dest_scripthash)]
+
+    def buildTokenTransfer(self, token, to_addr, amount):
+        """
+        Build a token transfer for an InvocationTransaction.
+
+        Args:
+            token: (str) the asset symbol or asset hash
+            to_addr: (str) the destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+            amount: (int/decimal) the amount of the asset to send
+        """
+        if not self.BALANCE:
+            raise RawTXError('Please specify a source address before building a token transfer.')
+
+        if not isinstance(token, str):
+            raise TypeError('Please enter your token as a string.')
+
+        # check if the token is in the source addr balance
+        t_hash = None
+        if len(token) == 40:  # check if token is a scripthash
+            for asset in self.BALANCE:
+                if asset['asset_hash'] == token:
+                    t_hash = asset['asset_hash']
+
+                    # also verify not insufficient funds
+                    if asset['amount'] < amount:
+                        raise AssetError("Insufficient funds.")
+                    break
+        else:  # assume the symbol was used
+            for asset in self.BALANCE:
+                if asset['asset_symbol'] == token:
+                    t_hash = asset['asset_hash']
+
+                    # also verify not insufficient funds
+                    if asset['amount'] < amount:
+                        raise AssetError("Insufficient funds.")   
+                    break 
+        if not t_hash:
+            raise AssetError(f'Token {token} not found in the source address balance.')
+
+        dest_scripthash = Helper.AddrStrToScriptHash(to_addr)  # also verifies if the address is valid
+
+        sb = ScriptBuilder()
+        sb.EmitAppCallWithOperationAndArgs(UInt160.ParseString(t_hash), 'transfer', [self.SOURCE_SCRIPTHASH.Data, dest_scripthash.Data, BigInteger(Fixed8.FromDecimal(amount).value)])
+        script = sb.ToArray()
+
+        self.Version = 1
+        self.Script = binascii.unhexlify(script)
+
+        # check to see if the source address has been added as a script attribute and add it if not found
+        s = 0
+        for attr in self.Attributes:
+            if attr.Usage == TransactionAttributeUsage.Script:
+                s = s + 1
+        if s == 0:
+            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=self.SOURCE_SCRIPTHASH))
+        if s > 1:
+            raise TXAttributeError('The script attribute must be used to verify the source address.')
 
 
 class RawTXError(Exception):
