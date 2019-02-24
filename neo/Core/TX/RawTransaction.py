@@ -8,7 +8,10 @@ from neo.Core.TX.Transaction import Transaction, TransactionType, TransactionOut
 from neo.Core.TX.TransactionAttribute import TransactionAttribute, TransactionAttributeUsage
 from neo.Core.Helper import Helper
 from neo.Core.Size import GetVarSize
+from neo.Core.Witness import Witness
 from neo.Implementations.Wallets.peewee.UserWallet import UserWallet
+from neo.IO.MemoryStream import MemoryStream
+from neocore.IO.BinaryReader import BinaryReader
 from neo.SmartContract.ContractParameterContext import ContractParametersContext
 from neo.Wallets.utils import to_aes_key
 from neo.VM.ScriptBuilder import ScriptBuilder
@@ -31,8 +34,6 @@ class RawTransaction(Transaction):
     _network = None
 
     __references = None
-
-    _signed = False
 
     def __init__(self, *args, **kwargs):
         """
@@ -325,25 +326,119 @@ class RawTransaction(Transaction):
         if neo_diff > Fixed8.Zero():
             self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.neo_asset_id), Value=neo_diff, script_hash=change_hash))
         if gas_diff > Fixed8.Zero() and Fixed8(sum(gas)) > Fixed8.Zero():
-            self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=Fixed8.FromDecimal(gas_diff), script_hash=change_hash))
+            self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=gas_diff, script_hash=change_hash))
 
-    def Verify(self, mempool):
+    def buildClaim(self, claim_addr, network="mainnet", to_addr=None):
         """
-        Verify the transaction.
-        """
-        if self.Size() > self.MAX_TX_SIZE:
-            raise TXAttributeError('Maximum transaction size exceeded.')
+        Builds a claim transaction for the specified address.
 
-        # calculate and verify the required network fee for the tx
-        if not self._network_fee:
-            self._network_fee = Fixed8.Zero()
-        fee = self._network_fee
-        if self.Size() > settings.MAX_FREE_TX_SIZE:
-            req_fee = Fixed8.FromDecimal(settings.FEE_PER_EXTRA_BYTE * (self.Size() - settings.MAX_FREE_TX_SIZE))
-            if req_fee < settings.LOW_PRIORITY_THRESHOLD:
-                req_fee = settings.LOW_PRIORITY_THRESHOLD
-            if fee < req_fee:
-                raise TXFeeError(f'The tx size ({tx.Size()}) exceeds the max free tx size ({settings.MAX_FREE_TX_SIZE}).\nA network fee of {req_fee.ToString()} GAS is required.')
+        Args:
+            claim_addr: (str) the address from which the claim is being constructed (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3'). NOTE: Claimed GAS is sent to the claim_addr by default
+            network: (str) the network to query (i.e. 'mainnet' or 'testnet'). Defaults to "mainnet".
+            to_addr: (str, optional) specify a different destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+        """
+        dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+
+        if network.lower() == "mainnet":
+            url = f"https://api.neoscan.io/api/main_net/v1/get_claimable/{claim_addr}"
+            self._network = "mainnet"
+        elif network.lower() == "testnet":
+            url = f"https://neoscan-testnet.io/api/test_net/v1/get_claimable/{claim_addr}"
+            self._network = "testnet"
+        else:
+            raise RawTXError(f"{network} is not a supported network.")
+        res = requests.get(url=url)
+
+        if not res.status_code == 200:
+            raise NetworkError('Neoscan request failed. Please check your internet connection.')
+
+        res = res.json()
+        available = res["unclaimed"]
+        if available == 0:
+            raise AssetError(f"Address {claim_addr} has 0 unclaimed GAS. Please ensure the correct network is selected or specify a difference source address.")
+
+        for ref in res['claimable']:
+            self.Claims.append(CoinReference(prev_hash=UInt256.ParseString(ref['txid']), prev_index=ref['n']))
+
+        if to_addr:
+            dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+
+        self.outputs = [TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=Fixed8.FromDecimal(available), script_hash=dest_scripthash)]
+
+    def buildTokenTransfer(self, token, to_addr, amount):
+        """
+        Build a token transfer for an InvocationTransaction.
+
+        Args:
+            token: (str) the asset symbol or asset hash
+            to_addr: (str) the destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+            amount: (int/decimal) the amount of the asset to send
+        """
+        if not self.BALANCE:
+            raise RawTXError('Please specify a source address before building a token transfer.')
+
+        if not isinstance(token, str):
+            raise TypeError('Please enter your token as a string.')
+
+        # check if the token is in the source addr balance
+        t_hash = None
+        if len(token) == 40:  # check if token is a scripthash
+            for asset in self.BALANCE:
+                if asset['asset_hash'] == token:
+                    t_hash = asset['asset_hash']
+
+                    # also verify not insufficient funds
+                    if asset['amount'] < amount:
+                        raise AssetError("Insufficient funds.")
+                    break
+        else:  # assume the symbol was used
+            for asset in self.BALANCE:
+                if asset['asset_symbol'] == token:
+                    t_hash = asset['asset_hash']
+
+                    # also verify not insufficient funds
+                    if asset['amount'] < amount:
+                        raise AssetError("Insufficient funds.")   
+                    break 
+        if not t_hash:
+            raise AssetError(f'Token {token} not found in the source address balance.')
+
+        dest_scripthash = Helper.AddrStrToScriptHash(to_addr)  # also verifies if the address is valid
+
+        sb = ScriptBuilder()
+        sb.EmitAppCallWithOperationAndArgs(UInt160.ParseString(t_hash), 'transfer', [self.SOURCE_SCRIPTHASH.Data, dest_scripthash.Data, BigInteger(Fixed8.FromDecimal(amount).value)])
+        script = sb.ToArray()
+
+        self.Version = 1
+        self.Script = binascii.unhexlify(script)
+
+        # check to see if the source address has been added as a script attribute and add it if not found
+        s = 0
+        for attr in self.Attributes:
+            if attr.Usage == TransactionAttributeUsage.Script:
+                s = s + 1
+        if s == 0:
+            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=self.SOURCE_SCRIPTHASH))
+        if s > 1:
+            raise TXAttributeError('The script attribute must be used to verify the source address.')
+
+    def importRawTX(self, raw_tx):
+        """
+        Import a raw transaction from an array.
+
+        Args:
+            raw_tx: (bytes) the raw transaction array
+        """
+        if not isinstance(raw_tx, bytes):
+            raise TypeError('Please input a byte array.')
+
+        try:
+            raw_tx = binascii.unhexlify(raw_tx)
+            ms = MemoryStream(raw_tx)
+            reader = BinaryReader(ms)
+            self.DeserializeFrom(reader)
+        except Exception as e:
+            raise FormatError(f'Unable to import raw transaction.\nError output: {e}')
 
     def Sign(self, WIForNEP2, NEP2password=None):
         """
@@ -365,7 +460,7 @@ class RawTransaction(Transaction):
         wallet.Sign(context)
         if context.Completed:
             self.scripts = context.GetScripts()
-            self._signed = True
+            self.Validate()  # ensure the tx is ready to be relayed
         else:
             raise SignatureError(f"Transaction initiated, but the signature is incomplete. Use the `sign` command with the information below to complete signing.\n{json.dumps(context.ToJson(), separators=(',', ':'))}")
         wallet.Close()
@@ -376,17 +471,125 @@ class RawTransaction(Transaction):
         """
         Returns the hash of the transaction.
         """
-        if not self._signed:
-            raise SignatureError('Please sign the transaction.')
         return self.Hash.ToString()
 
     def getRawTX(self):
         """
         Returns the transaction array, which is the input for "params" if sending via "sendrawtransaction".
         """
-        if not self._signed:
-            raise SignatureError('Please sign the transaction.')
         return self.ToArray()
+
+    def ToJson(self):
+        """
+        Convert object members to a dictionary that can be parsed as JSON.
+
+        Returns:
+             dict:
+        """
+        if self.Type == b'\x02':  # ClaimTransaction
+            json = super(RawTransaction, self).ToJson()
+            json['claims'] = [claim.ToJson() for claim in self.Claims]
+            return json
+        elif self.Type == b'\xd1':  # InvocationTransaction
+            jsn = super(RawTransaction, self).ToJson()
+            jsn['script'] = self.Script.hex()
+            jsn['gas'] = self.Gas.ToNeoJsonString()
+            return jsn
+        else:
+            return super(RawTransaction, self).ToJson()
+
+    def Validate(self):
+        """
+        Validate the transaction.
+        """
+        if self.Size() > self.MAX_TX_SIZE:
+            raise TXAttributeError('Maximum transaction size exceeded.')
+
+        # calculate and verify the required network fee for the tx
+        if not self._network_fee:
+            self._network_fee = Fixed8.Zero()
+        fee = self._network_fee
+        if self.Size() > settings.MAX_FREE_TX_SIZE:
+            req_fee = Fixed8.FromDecimal(settings.FEE_PER_EXTRA_BYTE * (self.Size() - settings.MAX_FREE_TX_SIZE))
+            if req_fee < settings.LOW_PRIORITY_THRESHOLD:
+                req_fee = settings.LOW_PRIORITY_THRESHOLD
+            if fee < req_fee:
+                raise TXFeeError(f'The tx size ({tx.Size()}) exceeds the max free tx size ({settings.MAX_FREE_TX_SIZE}).\nA network fee of {req_fee.ToString()} GAS is required.')
+
+    @property
+    def References(self):
+        """
+        Get all references.
+
+        Returns:
+            dict:
+                Key (UInt256): input PrevHash
+                Value (TransactionOutput): object.
+        """
+        if self.__references is None:
+            refs = {}
+            # group by the input prevhash
+            for hash, group in groupby(self.inputs, lambda x: x.PrevHash):
+                if self._network == "mainnet":
+                    url = f"https://api.neoscan.io/api/main_net/v1/get_transaction/{hash.ToString()}"
+                elif self._network == "testnet":
+                    url = f"https://neoscan-testnet.io/api/test_net/v1/get_transaction/{hash.ToString()}" 
+                tx = requests.get(url=url)
+
+                if not tx.status_code == 200:
+                    raise NetworkError('Neoscan request failed. Please check your internet connection.')
+                tx = tx.json()
+
+                if tx is not None:
+                    for input in group:
+                        t = tx['vouts'][input.PrevIndex]
+                        if t['asset'].lower() == 'neo':
+                            asset = UInt256.ParseString(self.neo_asset_id)
+                        elif t['asset'].lower() == 'gas':
+                            asset = UInt256.ParseString(self.gas_asset_id)
+                        refs[input] = TransactionOutput(AssetId=asset, Value=Fixed8.FromDecimal(t['value']), script_hash=Helper.AddrStrToScriptHash(t['address_hash']))
+
+            self.__references = refs
+
+        return self.__references
+
+    def Size(self):
+        """
+        Get the total size in bytes of the object.
+
+        Returns:
+            int: size.
+        """
+        if self.Type == b'\x02':  # ClaimTransaction
+            return super(RawTransaction, self).Size() + GetVarSize(self.Claims)
+        elif self.Type == b'\xd1':  # InvocationTransaction
+            return super(RawTransaction, self).Size() + GetVarSize(self.Script)
+        else:
+            return super(RawTransaction, self).Size()
+
+    def SystemFee(self):
+        """
+        Get the system fee.
+
+        Returns:
+            Fixed8:
+        """
+        if self.Type == b'\xd1':  # InvocationTransaction
+            return self.Gas
+        else:
+            return super(RawTransaction, self).SystemFee()
+
+    def NetworkFee(self):
+        """
+        Get the network fee.
+
+        Returns:
+            Fixed8:
+        """
+        if self.Type == b'\x02':  # ClaimTransaction
+            return Fixed8(0)
+        else:
+            return super(RawTransaction, self).NetworkFee()
 
     def SerializeExclusiveData(self, writer):
         """
@@ -485,193 +688,47 @@ class RawTransaction(Transaction):
         else:
             return super(RawTransaction, self).GetScriptHashesForVerifying()
 
-    @property
-    def References(self):
+    def DeserializeFrom(self, reader):
         """
-        Get all references.
-
-        Returns:
-            dict:
-                Key (UInt256): input PrevHash
-                Value (TransactionOutput): object.
-        """
-        if self.__references is None:
-            refs = {}
-            # group by the input prevhash
-            for hash, group in groupby(self.inputs, lambda x: x.PrevHash):
-                if self._network == "mainnet":
-                    url = f"https://api.neoscan.io/api/main_net/v1/get_transaction/{hash.ToString()}"
-                elif self._network == "testnet":
-                    url = f"https://neoscan-testnet.io/api/test_net/v1/get_transaction/{hash.ToString()}" 
-                tx = requests.get(url=url)
-
-                if not tx.status_code == 200:
-                    raise NetworkError('Neoscan request failed. Please check your internet connection.')
-                tx = tx.json()
-
-                if tx is not None:
-                    for input in group:
-                        t = tx['vouts'][input.PrevIndex]
-                        if t['asset'].lower() == 'neo':
-                            asset = UInt256.ParseString(self.neo_asset_id)
-                        elif t['asset'].lower() == 'gas':
-                            asset = UInt256.ParseString(self.gas_asset_id)
-                        refs[input] = TransactionOutput(AssetId=asset, Value=Fixed8.FromDecimal(t['value']), script_hash=Helper.AddrStrToScriptHash(t['address_hash']))
-
-            self.__references = refs
-
-        return self.__references
-
-    def Size(self):
-        """
-        Get the total size in bytes of the object.
-
-        Returns:
-            int: size.
-        """
-        if self.Type == b'\x02':  # ClaimTransaction
-            return super(RawTransaction, self).Size() + GetVarSize(self.Claims)
-        elif self.Type == b'\xd1':  # InvocationTransaction
-            return super(RawTransaction, self).Size() + GetVarSize(self.Script)
-        else:
-            return super(RawTransaction, self).Size()
-
-    def SystemFee(self):
-        """
-        Get the system fee.
-
-        Returns:
-            Fixed8:
-        """
-        if self.Type == b'\xd1':  # InvocationTransaction
-            return self.Gas
-        else:
-            return super(RawTransaction, self).SystemFee()
-
-    def NetworkFee(self):
-        """
-        Get the network fee.
-
-        Returns:
-            Fixed8:
-        """
-        if self.Type == b'\x02':  # ClaimTransaction
-            return Fixed8(0)
-        else:
-            return super(RawTransaction, self).NetworkFee()
-
-    def ToJson(self):
-        """
-        Convert object members to a dictionary that can be parsed as JSON.
-
-        Returns:
-             dict:
-        """
-        if self.Type == b'\x02':  # ClaimTransaction
-            json = super(RawTransaction, self).ToJson()
-            json['claims'] = [claim.ToJson() for claim in self.Claims]
-            return json
-        elif self.Type == b'\xd1':  # InvocationTransaction
-            jsn = super(RawTransaction, self).ToJson()
-            jsn['script'] = self.Script.hex()
-            jsn['gas'] = self.Gas.ToNeoJsonString()
-            return jsn
-        else:
-            return super(RawTransaction, self).ToJson()
-
-    def buildClaim(self, claim_addr, network="mainnet", to_addr=None):
-        """
-        Builds a claim transaction for the specified address.
+        Deserialize full object.
 
         Args:
-            claim_addr: (str) the address from which the claim is being constructed (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3'). NOTE: Claimed GAS is sent to the claim_addr by default
-            network: (str) the network to query (i.e. 'mainnet' or 'testnet'). Defaults to "mainnet".
-            to_addr: (str, optional) specify a different destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
+            reader (neo.IO.BinaryReader):
         """
-        dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+        ttype = reader.ReadByte()
 
-        if network.lower() == "mainnet":
-            url = f"https://api.neoscan.io/api/main_net/v1/get_claimable/{claim_addr}"
-            self._network = "mainnet"
-        elif network.lower() == "testnet":
-            url = f"https://neoscan-testnet.io/api/test_net/v1/get_claimable/{claim_addr}"
-            self._network = "testnet"
+        if ttype == int.from_bytes(TransactionType.RegisterTransaction, 'little'):
+            self.Type = TransactionType.RegisterTransaction
+        elif ttype == int.from_bytes(TransactionType.MinerTransaction, 'little'):
+            self.Type = TransactionType.MinerTransaction
+        elif ttype == int.from_bytes(TransactionType.IssueTransaction, 'little'):
+            self.Type = TransactionType.IssueTransaction
+        elif ttype == int.from_bytes(TransactionType.ClaimTransaction, 'little'):
+            self.Type = TransactionType.ClaimTransaction
+        elif ttype == int.from_bytes(TransactionType.PublishTransaction, 'little'):
+            self.Type = TransactionType.PublishTransaction
+        elif ttype == int.from_bytes(TransactionType.InvocationTransaction, 'little'):
+            self.Type = TransactionType.InvocationTransaction
+        elif ttype == int.from_bytes(TransactionType.EnrollmentTransaction, 'little'):
+            self.Type = TransactionType.EnrollmentTransaction
+        elif ttype == int.from_bytes(TransactionType.StateTransaction, 'little'):
+            self.Type = TransactionType.StateTransaction
         else:
-            raise RawTXError(f"{network} is not a supported network.")
-        res = requests.get(url=url)
+            self.Type = ttype
 
-        if not res.status_code == 200:
-            raise NetworkError('Neoscan request failed. Please check your internet connection.')
+        self.DeserializeUnsignedWithoutType(reader)
 
-        res = res.json()
-        available = res["unclaimed"]
-        if available == 0:
-            raise AssetError(f"Address {claim_addr} has 0 unclaimed GAS. Please ensure the correct network is selected or specify a difference source address.")
+        self.scripts = []
+        byt = reader.ReadVarInt()
 
-        for ref in res['claimable']:
-            self.Claims.append(CoinReference(prev_hash=UInt256.ParseString(ref['txid']), prev_index=ref['n']))
+        if byt > 0:
+            for i in range(0, byt):
+                witness = Witness()
+                witness.Deserialize(reader)
 
-        if to_addr:
-            dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+                self.scripts.append(witness)
 
-        self.outputs = [TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=Fixed8.FromDecimal(available), script_hash=dest_scripthash)]
-
-    def buildTokenTransfer(self, token, to_addr, amount):
-        """
-        Build a token transfer for an InvocationTransaction.
-
-        Args:
-            token: (str) the asset symbol or asset hash
-            to_addr: (str) the destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
-            amount: (int/decimal) the amount of the asset to send
-        """
-        if not self.BALANCE:
-            raise RawTXError('Please specify a source address before building a token transfer.')
-
-        if not isinstance(token, str):
-            raise TypeError('Please enter your token as a string.')
-
-        # check if the token is in the source addr balance
-        t_hash = None
-        if len(token) == 40:  # check if token is a scripthash
-            for asset in self.BALANCE:
-                if asset['asset_hash'] == token:
-                    t_hash = asset['asset_hash']
-
-                    # also verify not insufficient funds
-                    if asset['amount'] < amount:
-                        raise AssetError("Insufficient funds.")
-                    break
-        else:  # assume the symbol was used
-            for asset in self.BALANCE:
-                if asset['asset_symbol'] == token:
-                    t_hash = asset['asset_hash']
-
-                    # also verify not insufficient funds
-                    if asset['amount'] < amount:
-                        raise AssetError("Insufficient funds.")   
-                    break 
-        if not t_hash:
-            raise AssetError(f'Token {token} not found in the source address balance.')
-
-        dest_scripthash = Helper.AddrStrToScriptHash(to_addr)  # also verifies if the address is valid
-
-        sb = ScriptBuilder()
-        sb.EmitAppCallWithOperationAndArgs(UInt160.ParseString(t_hash), 'transfer', [self.SOURCE_SCRIPTHASH.Data, dest_scripthash.Data, BigInteger(Fixed8.FromDecimal(amount).value)])
-        script = sb.ToArray()
-
-        self.Version = 1
-        self.Script = binascii.unhexlify(script)
-
-        # check to see if the source address has been added as a script attribute and add it if not found
-        s = 0
-        for attr in self.Attributes:
-            if attr.Usage == TransactionAttributeUsage.Script:
-                s = s + 1
-        if s == 0:
-            self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=self.SOURCE_SCRIPTHASH))
-        if s > 1:
-            raise TXAttributeError('The script attribute must be used to verify the source address.')
+        self.OnDeserialized()
 
 
 class RawTXError(Exception):
