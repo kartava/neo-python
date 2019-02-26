@@ -12,9 +12,10 @@ from neo.Core.Witness import Witness
 from neo.Implementations.Wallets.peewee.UserWallet import UserWallet
 from neo.IO.MemoryStream import MemoryStream
 from neocore.IO.BinaryReader import BinaryReader
-from neo.SmartContract.ContractParameterContext import ContractParametersContext
+from neo.SmartContract.ContractParameterContext import ContractParametersContext, Contract
 from neo.Wallets.utils import to_aes_key
 from neo.VM.ScriptBuilder import ScriptBuilder
+from neocore.Cryptography.Crypto import Crypto
 from neocore.Fixed8 import Fixed8
 from neocore.UInt256 import UInt256
 from neocore.UInt160 import UInt160
@@ -25,15 +26,15 @@ from itertools import groupby
 
 class RawTransaction(Transaction):
     """A class for building raw transactions."""
-    SOURCE_SCRIPTHASH = None
-    BALANCE = None
 
     neo_asset_id = "c56f33fc6ecfcd0c225c4ab356fee59390af8560be0e930faebe74a6daff7c9b"
     gas_asset_id = "602c79718b16e442de58778e148d0b1084e3b2dffd5de6b7b16cee7969282de7"
 
-    _network = None
-
-    __references = None
+    _ns_mainnet = "https://neoscan.io/api/main_net"
+    _ns_testnet = "https://neoscan-testnet.io/api/test_net"
+    _get_balance = "/v1/get_balance/"
+    _get_claimable = "/v1/get_claimable/"
+    _get_transaction = "/v1/get_transaction/"
 
     def __init__(self, *args, **kwargs):
         """
@@ -45,6 +46,11 @@ class RawTransaction(Transaction):
         """
         super(RawTransaction, self).__init__(*args, **kwargs)
         self.raw_tx = True
+        self._network = None
+        self._context = None
+        self.__references = None
+        self.SOURCE_SCRIPTHASH = None
+        self.BALANCE = None
 
     def TXType(self, attribute):
         """
@@ -68,7 +74,7 @@ class RawTransaction(Transaction):
         else:
             raise TypeError("Please specify a supported transaction type.")
 
-    def addDescription(self, description):
+    def AddDescription(self, description):
         """
         Specify a description for the transaction
 
@@ -80,14 +86,14 @@ class RawTransaction(Transaction):
 
         description = description.encode('utf-8')
         if len(description) > TransactionAttribute.MAX_ATTR_DATA_SIZE:
-            raise TXAttributeError('Exceeded max attribute size.')
+            raise TXAttributeError(f'Maximum description length exceeded ({len(description)} > {TransactionAttribute.MAX_ATTR_DATA_SIZE})')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Description, data=description))
         else:
-            raise TXAttributeError('Max number of transaction attributes reached.')
+            raise TXAttributeError(f'Cannot add description attribute. Maximum transaction attributes ({Transaction.MAX_TX_ATTRIBUTES}) already reached.')
 
-    def addDescriptionUrl(self, description_url):
+    def AddDescriptionUrl(self, description_url):
         """
         Specify a description for the transaction
 
@@ -99,14 +105,14 @@ class RawTransaction(Transaction):
 
         description_url = description_url.encode('utf-8')
         if len(description_url) > 255:
-            raise TXAttributeError('Exceeded max attribute size.')
+            raise TXAttributeError(f'Maximum description url length exceeded ({len(description_url)} > 255)')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.DescriptionUrl, data=description_url))
         else:
-            raise TXAttributeError('Max number of transaction attributes reached.')
+            raise TXAttributeError(f'Cannot add description url attribute. Maximum transaction attributes ({Transaction.MAX_TX_ATTRIBUTES}) already reached.')
 
-    def addRemark(self, remark):
+    def AddRemark(self, remark):
         """
         Specify a remark for the transaction
 
@@ -118,10 +124,10 @@ class RawTransaction(Transaction):
 
         remark = remark.encode('utf-8')
         if len(remark) > TransactionAttribute.MAX_ATTR_DATA_SIZE:
-            raise TXAttributeError('Exceeded max attribute size.')
+            raise TXAttributeError(f'Maximum remark length exceeded ({len(remark)} > {TransactionAttribute.MAX_ATTR_DATA_SIZE})')
 
+        remarks = []
         for attribute in self.Attributes:
-            remarks = []
             if attribute.Usage in range(240, 255):
                 remarks.append(attribute.Usage)
 
@@ -131,17 +137,17 @@ class RawTransaction(Transaction):
 
             last_remark = remarks[-1]
 
-            if last_remark < 255:
+            if last_remark < 255 and len(remarks) < Transaction.MAX_TX_ATTRIBUTES:
                 new_remark = last_remark + 1
             else:
-                raise TXAttributeError('Max number of remarks reached.')
+                raise TXAttributeError(f'Cannot add remark attribute. Maximum transaction attributes ({Transaction.MAX_TX_ATTRIBUTES}) already reached.')
 
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=new_remark, data=remark))
         else:
-            raise TXAttributeError('Max number of transaction attributes reached.')
+            raise TXAttributeError(f'Cannot add remark attribute. Maximum transaction attributes ({Transaction.MAX_TX_ATTRIBUTES}) already reached.')
 
-    def addScript(self, address):
+    def AddScript(self, address):
         """
         Specify a script for the transaction
 
@@ -153,27 +159,28 @@ class RawTransaction(Transaction):
         if len(self.Attributes) < Transaction.MAX_TX_ATTRIBUTES:
             self.Attributes.append(TransactionAttribute(usage=TransactionAttributeUsage.Script, data=address))
         else:
-            raise TXAttributeError('Max number of transaction attributes reached.')
+            raise TXAttributeError(f'Cannot add script attribute. Maximum transaction attributes ({Transaction.MAX_TX_ATTRIBUTES}) already reached.')
 
-    def sourceAddress(self, from_addr, network="mainnet"):
+    def SourceAddress(self, from_addr, network="mainnet"):
         """
         Specify the source address for the transaction. Also sets the inputs for the transaction.
 
         Args:
             from_addr: (str) the source NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
-            network: (str) the network to query (i.e. 'mainnet' or 'testnet'). Defaults to "mainnet".
+            network: (str) the network to query (i.e. 'mainnet', 'testnet', or custom endpoint). Defaults to "mainnet".
         """
         src_scripthash = Helper.AddrStrToScriptHash(from_addr)  # also verifies if the address is valid
         self.SOURCE_SCRIPTHASH = src_scripthash
 
         if network.lower() == "mainnet":
             self._network = "mainnet"
-            url = f"https://api.neoscan.io/api/main_net/v1/get_balance/{from_addr}"
+            url = self._ns_mainnet + self._get_balance + from_addr
         elif network.lower() == "testnet":
             self._network = "testnet"
-            url = f"https://neoscan-testnet.io/api/test_net/v1/get_balance/{from_addr}"
+            url = self._ns_testnet + self._get_balance + from_addr
         else:
-            raise RawTXError(f"{network} is not a supported network.")
+            self._network = network
+            url = network + self._get_balance + from_addr
         bal = requests.get(url=url)
 
         if not bal.status_code == 200:
@@ -184,7 +191,7 @@ class RawTransaction(Transaction):
             raise RawTXError(f"Address {from_addr} has a zero balance. Please ensure the correct network is selected or specify a difference source address.")
         self.BALANCE = bal['balance']
 
-    def addInputs(self, asset):
+    def AddInputs(self, asset):
         """
         Specify inputs for the transaction based on the asset to be sent.
         NOTE: Can be used multiple times if sending multiple assets (i.e. NEO and GAS).
@@ -220,7 +227,7 @@ class RawTransaction(Transaction):
         if not self.inputs:
             raise AssetError('No matching assets found at the specified source address.')
 
-    def addOutput(self, asset, to_addr, amount):
+    def AddOutput(self, asset, to_addr, amount):
         """
         Specify an output for the transaction.
         NOTE: Can be used multiple times to create multiple outputs.
@@ -268,7 +275,7 @@ class RawTransaction(Transaction):
 
         self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(assetId), Value=f8amount, script_hash=dest_scripthash))
 
-    def addNetworkFee(self, fee):
+    def AddNetworkFee(self, fee):
         """
         Specify a priority network fee.
 
@@ -281,7 +288,7 @@ class RawTransaction(Transaction):
         fee = Fixed8.FromDecimal(fee)
         self._network_fee = fee
 
-    def calcChange(self, change_addr=None):
+    def CalcChange(self, change_addr=None):
         """
         Calculates the change output(s). NOTE: Assumes all other outputs have been added.
 
@@ -328,25 +335,26 @@ class RawTransaction(Transaction):
         if gas_diff > Fixed8.Zero() and Fixed8(sum(gas)) > Fixed8.Zero():
             self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=gas_diff, script_hash=change_hash))
 
-    def buildClaim(self, claim_addr, network="mainnet", to_addr=None):
+    def AddClaim(self, claim_addr, network="mainnet", to_addr=None):
         """
         Builds a claim transaction for the specified address.
 
         Args:
             claim_addr: (str) the address from which the claim is being constructed (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3'). NOTE: Claimed GAS is sent to the claim_addr by default
-            network: (str) the network to query (i.e. 'mainnet' or 'testnet'). Defaults to "mainnet".
+            network: (str) the network to query (i.e. 'mainnet', 'testnet', or custom endpoint). Defaults to "mainnet".
             to_addr: (str, optional) specify a different destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
         """
         dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
 
         if network.lower() == "mainnet":
-            url = f"https://api.neoscan.io/api/main_net/v1/get_claimable/{claim_addr}"
+            url = self._ns_mainnet + self._get_claimable + claim_addr
             self._network = "mainnet"
         elif network.lower() == "testnet":
-            url = f"https://neoscan-testnet.io/api/test_net/v1/get_claimable/{claim_addr}"
+            url = self._ns_testnet + self._get_claimable + claim_addr
             self._network = "testnet"
         else:
-            raise RawTXError(f"{network} is not a supported network.")
+            self._network = network
+            url = network + self._get_claimable + claim_addr
         res = requests.get(url=url)
 
         if not res.status_code == 200:
@@ -361,11 +369,11 @@ class RawTransaction(Transaction):
             self.Claims.append(CoinReference(prev_hash=UInt256.ParseString(ref['txid']), prev_index=ref['n']))
 
         if to_addr:
-            dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+            dest_scripthash = Helper.AddrStrToScriptHash(to_addr)  # also verifies if the address is valid
 
-        self.outputs = [TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=Fixed8.FromDecimal(available), script_hash=dest_scripthash)]
+        self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=Fixed8.FromDecimal(available), script_hash=dest_scripthash))
 
-    def buildTokenTransfer(self, token, to_addr, amount):
+    def BuildTokenTransfer(self, token, to_addr, amount):
         """
         Build a token transfer for an InvocationTransaction.
 
@@ -422,7 +430,7 @@ class RawTransaction(Transaction):
         if s > 1:
             raise TXAttributeError('The script attribute must be used to verify the source address.')
 
-    def importRawTX(self, raw_tx):
+    def ImportFromArray(self, raw_tx):
         """
         Import a raw transaction from an array.
 
@@ -440,40 +448,54 @@ class RawTransaction(Transaction):
         except Exception as e:
             raise FormatError(f'Unable to import raw transaction.\nError output: {e}')
 
-    def Sign(self, WIForNEP2, NEP2password=None):
+    def Sign(self, NEP2orWIF, NEP2password=None, multisig_args=[]):
         """
         Sign the raw transaction
 
         Args:
-            WIForNEP2: (str) the WIF or NEP2 key string from the address you are sending from. NOTE: Assumes WIF if NEP2password is None.
+            NEP2orWIF: (str) the NEP2 or WIF key string from the address you are sending from. NOTE: Assumes WIF if NEP2password is None.
             NEP2password: (str, optional) the NEP2 password associated with the NEP2 key string. Defaults to None.
+            multisig_args: (list, optional) the arguments for importing a multsig address (e.g. [<owner pubkey>, <num required sigs>, [<signing pubkey>, ...]])
         """
         temp_path = "temp_wallet.wallet"
         temp_password = "1234567890"
         wallet = UserWallet.Create(temp_path, to_aes_key(temp_password), generate_default_key=False)
         if NEP2password:
-            private_key = KeyPair.PrivateKeyFromNEP2(WIForNEP2, NEP2password)
+            private_key = KeyPair.PrivateKeyFromNEP2(NEP2orWIF, NEP2password)
         else:
-            private_key = KeyPair.PrivateKeyFromWIF(WIForNEP2)
+            private_key = KeyPair.PrivateKeyFromWIF(NEP2orWIF)
         wallet.CreateKey(private_key)
-        context = ContractParametersContext(self)
+
+        if multisig_args:  # import a multisig address
+            verification_contract = Contract.CreateMultiSigContract(Crypto.ToScriptHash(multisig_args[0], unhex=True), multisig_args[1], multisig_args[2])
+            wallet.AddContract(verification_contract)
+
+        if not self._context:
+            signer_contract = wallet.GetContract(self.SOURCE_SCRIPTHASH)
+            context = ContractParametersContext(self, isMultiSig=signer_contract.IsMultiSigContract)
+        else:
+            context = self._context
+
         wallet.Sign(context)
         if context.Completed:
             self.scripts = context.GetScripts()
             self.Validate()  # ensure the tx is ready to be relayed
+        elif context.ContextItems:
+            self._context = context
+            print("Transaction initiated, but the signature is incomplete. Sign again with another valid multi-sig keypair.")
         else:
-            raise SignatureError(f"Transaction initiated, but the signature is incomplete. Use the `sign` command with the information below to complete signing.\n{json.dumps(context.ToJson(), separators=(',', ':'))}")
+            raise SignatureError("Unable to sign transaction.")
         wallet.Close()
         wallet = None
         os.remove(temp_path)
 
-    def getTXID(self):
+    def GetTXID(self):
         """
         Returns the hash of the transaction.
         """
         return self.Hash.ToString()
 
-    def getRawTX(self):
+    def GetRawTX(self):
         """
         Returns the transaction array, which is the input for "params" if sending via "sendrawtransaction".
         """
@@ -514,7 +536,7 @@ class RawTransaction(Transaction):
             if req_fee < settings.LOW_PRIORITY_THRESHOLD:
                 req_fee = settings.LOW_PRIORITY_THRESHOLD
             if fee < req_fee:
-                raise TXFeeError(f'The tx size ({tx.Size()}) exceeds the max free tx size ({settings.MAX_FREE_TX_SIZE}).\nA network fee of {req_fee.ToString()} GAS is required.')
+                raise TXFeeError(f'The tx size ({self.Size()}) exceeds the max free tx size ({settings.MAX_FREE_TX_SIZE}).\nA network fee of {req_fee.ToString()} GAS is required.')
 
     @property
     def References(self):
@@ -531,9 +553,11 @@ class RawTransaction(Transaction):
             # group by the input prevhash
             for hash, group in groupby(self.inputs, lambda x: x.PrevHash):
                 if self._network == "mainnet":
-                    url = f"https://api.neoscan.io/api/main_net/v1/get_transaction/{hash.ToString()}"
+                    url = self._ns_mainnet + self._get_transaction + hash.ToString()
                 elif self._network == "testnet":
-                    url = f"https://neoscan-testnet.io/api/test_net/v1/get_transaction/{hash.ToString()}" 
+                    url = self._ns_testnet + self._get_transaction + hash.ToString()
+                else:
+                    url = self._network + self._get_transaction + hash.ToString()
                 tx = requests.get(url=url)
 
                 if not tx.status_code == 200:
@@ -661,9 +685,11 @@ class RawTransaction(Transaction):
 
             for hash, group in groupby(self.Claims, lambda x: x.PrevHash):
                 if self._network == "mainnet":
-                    url = f"https://api.neoscan.io/api/main_net/v1/get_transaction/{hash.ToString()}"
+                    url = self._ns_mainnet + self._get_transaction + hash.ToString()
                 elif self._network == "testnet":
-                    url = f"https://neoscan-testnet.io/api/test_net/v1/get_transaction/{hash.ToString()}" 
+                    url = self._ns_testnet + self._get_transaction + hash.ToString()
+                else:
+                    url = self._network + self._get_transaction + hash.ToString()
                 tx = requests.get(url=url)
 
                 if not tx.status_code == 200:
