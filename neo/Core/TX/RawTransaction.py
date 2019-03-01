@@ -46,7 +46,7 @@ class RawTransaction(Transaction):
         """
         super(RawTransaction, self).__init__(*args, **kwargs)
         self.raw_tx = True
-        self._network = None
+        self._network = self._ns_testnet
         self._context = None
         self.__references = None
         self.SOURCE_SCRIPTHASH = None
@@ -161,26 +161,34 @@ class RawTransaction(Transaction):
         else:
             raise TXAttributeError(f'Cannot add script attribute. Maximum transaction attributes ({Transaction.MAX_TX_ATTRIBUTES}) already reached.')
 
-    def SourceAddress(self, from_addr, network="mainnet"):
+    def Network(self, network):
         """
-        Specify the source address for the transaction. Also sets the inputs for the transaction.
+        Specify a neo-scan endpoint.
 
         Args:
-            from_addr: (str) the source NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
-            network: (str) the network to query (i.e. 'mainnet', 'testnet', or custom endpoint). Defaults to "mainnet".
+            network: (str) the neo-scan endpoint (i.e. 'mainnet', 'testnet', or custom endpoint)
+        """
+        if not isinstance(network, str):
+            raise TypeError('Please enter your network as a string.')
+
+        if network.lower() == "mainnet":
+            self._network = self._ns_mainnet
+        elif network.lower() == "testnet":
+            self._network = self._ns_testnet
+        else:
+            self._network = network
+
+    def Address(self, from_addr):
+        """
+        Specify the originating address for the transaction.
+
+        Args:
+            from_addr: (str) the source NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')  
         """
         src_scripthash = Helper.AddrStrToScriptHash(from_addr)  # also verifies if the address is valid
         self.SOURCE_SCRIPTHASH = src_scripthash
 
-        if network.lower() == "mainnet":
-            self._network = "mainnet"
-            url = self._ns_mainnet + self._get_balance + from_addr
-        elif network.lower() == "testnet":
-            self._network = "testnet"
-            url = self._ns_testnet + self._get_balance + from_addr
-        else:
-            self._network = network
-            url = network + self._get_balance + from_addr
+        url = self._network + self._get_balance + from_addr
         bal = requests.get(url=url)
 
         if not bal.status_code == 200:
@@ -335,26 +343,18 @@ class RawTransaction(Transaction):
         if gas_diff > Fixed8.Zero() and Fixed8(sum(gas)) > Fixed8.Zero():
             self.outputs.append(TransactionOutput(AssetId=UInt256.ParseString(self.gas_asset_id), Value=gas_diff, script_hash=change_hash))
 
-    def AddClaim(self, claim_addr, network="mainnet", to_addr=None):
+    def AddClaim(self, claim_addr, to_addr=None):
         """
         Builds a claim transaction for the specified address.
 
         Args:
             claim_addr: (str) the address from which the claim is being constructed (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3'). NOTE: Claimed GAS is sent to the claim_addr by default
-            network: (str) the network to query (i.e. 'mainnet', 'testnet', or custom endpoint). Defaults to "mainnet".
             to_addr: (str, optional) specify a different destination NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
         """
         dest_scripthash = Helper.AddrStrToScriptHash(claim_addr)  # also verifies if the address is valid
+        self.SOURCE_SCRIPTHASH = dest_scripthash
 
-        if network.lower() == "mainnet":
-            url = self._ns_mainnet + self._get_claimable + claim_addr
-            self._network = "mainnet"
-        elif network.lower() == "testnet":
-            url = self._ns_testnet + self._get_claimable + claim_addr
-            self._network = "testnet"
-        else:
-            self._network = network
-            url = network + self._get_claimable + claim_addr
+        url = self._network + self._get_claimable + claim_addr
         res = requests.get(url=url)
 
         if not res.status_code == 200:
@@ -470,11 +470,13 @@ class RawTransaction(Transaction):
             verification_contract = Contract.CreateMultiSigContract(Crypto.ToScriptHash(multisig_args[0], unhex=True), multisig_args[1], multisig_args[2])
             wallet.AddContract(verification_contract)
 
-        if not self._context:
+        if self.Type == b'\xd1' and not self.SOURCE_SCRIPTHASH:  # in case of an invocation with no funds transfer
+            context = ContractParametersContext(self)
+        elif not self._context:  # used during transactions involving a funds transfer
             signer_contract = wallet.GetContract(self.SOURCE_SCRIPTHASH)
             context = ContractParametersContext(self, isMultiSig=signer_contract.IsMultiSigContract)
         else:
-            context = self._context
+            context = self._context  # used for a follow-on signature for a multi-sig transaction
 
         wallet.Sign(context)
         if context.Completed:
@@ -552,12 +554,7 @@ class RawTransaction(Transaction):
             refs = {}
             # group by the input prevhash
             for hash, group in groupby(self.inputs, lambda x: x.PrevHash):
-                if self._network == "mainnet":
-                    url = self._ns_mainnet + self._get_transaction + hash.ToString()
-                elif self._network == "testnet":
-                    url = self._ns_testnet + self._get_transaction + hash.ToString()
-                else:
-                    url = self._network + self._get_transaction + hash.ToString()
+                url = self._network + self._get_transaction + hash.ToString()
                 tx = requests.get(url=url)
 
                 if not tx.status_code == 200:
@@ -684,12 +681,7 @@ class RawTransaction(Transaction):
             hashes = super(RawTransaction, self).GetScriptHashesForVerifying()
 
             for hash, group in groupby(self.Claims, lambda x: x.PrevHash):
-                if self._network == "mainnet":
-                    url = self._ns_mainnet + self._get_transaction + hash.ToString()
-                elif self._network == "testnet":
-                    url = self._ns_testnet + self._get_transaction + hash.ToString()
-                else:
-                    url = self._network + self._get_transaction + hash.ToString()
+                url = self._network + self._get_transaction + hash.ToString()
                 tx = requests.get(url=url)
 
                 if not tx.status_code == 200:
