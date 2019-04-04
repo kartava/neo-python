@@ -2,25 +2,25 @@ import os
 import binascii
 import requests
 import json
-from neo.Settings import settings
+from neo.Core.BigInteger import BigInteger
 from neo.Core.CoinReference import CoinReference
+from neo.Core.Cryptography.Crypto import Crypto
+from neo.Core.Fixed8 import Fixed8
+from neo.Core.Helper import Helper
+from neo.Core.IO.BinaryReader import BinaryReader
+from neo.Core.KeyPair import KeyPair
+from neo.Core.Size import GetVarSize, Size
 from neo.Core.TX.Transaction import Transaction, TransactionType, TransactionOutput, TXFeeError
 from neo.Core.TX.TransactionAttribute import TransactionAttribute, TransactionAttributeUsage
-from neo.Core.Helper import Helper
-from neo.Core.Size import GetVarSize
+from neo.Core.UInt256 import UInt256
+from neo.Core.UInt160 import UInt160
 from neo.Core.Witness import Witness
 from neo.Implementations.Wallets.peewee.UserWallet import UserWallet
 from neo.IO.MemoryStream import MemoryStream
-from neocore.IO.BinaryReader import BinaryReader
+from neo.Settings import settings
 from neo.SmartContract.ContractParameterContext import ContractParametersContext, Contract
 from neo.Wallets.utils import to_aes_key
 from neo.VM.ScriptBuilder import ScriptBuilder
-from neocore.Cryptography.Crypto import Crypto
-from neocore.Fixed8 import Fixed8
-from neocore.UInt256 import UInt256
-from neocore.UInt160 import UInt160
-from neocore.BigInteger import BigInteger
-from neocore.KeyPair import KeyPair
 from itertools import groupby
 
 
@@ -584,7 +584,8 @@ class RawTransaction(Transaction):
         if self.Type == b'\x02':  # ClaimTransaction
             return super(RawTransaction, self).Size() + GetVarSize(self.Claims)
         elif self.Type == b'\xd1':  # InvocationTransaction
-            return super(RawTransaction, self).Size() + GetVarSize(self.Script)
+            sizeGas = Size.uint64 if self.Version >= 1 else 0
+            return super(RawTransaction, self).Size() + GetVarSize(self.Script) + sizeGas
         else:
             return super(RawTransaction, self).Size()
 
