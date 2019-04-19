@@ -183,7 +183,7 @@ class RawTransaction(Transaction):
         Specify the originating address for the transaction.
 
         Args:
-            from_addr: (str) the source NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')  
+            from_addr: (str) the source NEO address (e.g. 'AJQ6FoaSXDFzA6wLnyZ1nFN7SGSN2oNTc3')
         """
         src_scripthash = Helper.AddrStrToScriptHash(from_addr)  # also verifies if the address is valid
         self.SOURCE_SCRIPTHASH = src_scripthash
@@ -231,7 +231,7 @@ class RawTransaction(Transaction):
                 if not asset['unspent']:
                     raise AssetError('No unspent assets found.')
                 for unspent in asset['unspent']:
-                    self.inputs.append(CoinReference(prev_hash=UInt256.ParseString(unspent['txid']), prev_index=unspent['n'])) 
+                    self.inputs.append(CoinReference(prev_hash=UInt256.ParseString(unspent['txid']), prev_index=unspent['n']))
         if not self.inputs:
             raise AssetError('No matching assets found at the specified source address.')
 
@@ -406,8 +406,8 @@ class RawTransaction(Transaction):
 
                     # also verify not insufficient funds
                     if asset['amount'] < amount:
-                        raise AssetError("Insufficient funds.")   
-                    break 
+                        raise AssetError("Insufficient funds.")
+                    break
         if not t_hash:
             raise AssetError(f'Token {token} not found in the source address balance.')
 
@@ -448,12 +448,12 @@ class RawTransaction(Transaction):
         except Exception as e:
             raise FormatError(f'Unable to import raw transaction.\nError output: {e}')
 
-    def Sign(self, NEP2orWIF, NEP2password=None, multisig_args=[]):
+    def Sign(self, NEP2orPrivateKey, NEP2password=None, multisig_args=[]):
         """
         Sign the raw transaction
 
         Args:
-            NEP2orWIF: (str) the NEP2 or WIF key string from the address you are sending from. NOTE: Assumes WIF if NEP2password is None.
+            NEP2orPrivateKey: (str) the NEP2 or PrivateKey string from the address you are sending from. NOTE: Assumes WIF if NEP2password is None.
             NEP2password: (str, optional) the NEP2 password associated with the NEP2 key string. Defaults to None.
             multisig_args: (list, optional) the arguments for importing a multsig address (e.g. [<owner pubkey>, <num required sigs>, [<signing pubkey>, ...]])
         """
@@ -463,7 +463,7 @@ class RawTransaction(Transaction):
         if NEP2password:
             private_key = KeyPair.PrivateKeyFromNEP2(NEP2orWIF, NEP2password)
         else:
-            private_key = KeyPair.PrivateKeyFromWIF(NEP2orWIF)
+            private_key = binascii.unhexlify(NEP2orPrivateKey)
         wallet.CreateKey(private_key)
 
         if multisig_args:  # import a multisig address
@@ -678,7 +678,7 @@ class RawTransaction(Transaction):
         Returns:
             list: of UInt160 type script hashes.
         """
-        if self.Type == b'\x02':  # ClaimTransaction 
+        if self.Type == b'\x02':  # ClaimTransaction
             hashes = super(RawTransaction, self).GetScriptHashesForVerifying()
 
             for hash, group in groupby(self.Claims, lambda x: x.PrevHash):
