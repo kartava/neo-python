@@ -501,7 +501,7 @@ class RawTransaction(Transaction):
         """
         Returns the transaction array, which is the input for "params" if sending via "sendrawtransaction".
         """
-        return self.ToArray()
+        return self.ToArray().decode('utf-8')
 
     def ToJson(self):
         """
